@@ -40,6 +40,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod, VocabParallelEmbedding
 from vllm.model_executor.models.utils import WeightsMapper
 
+from vllm_ascend import envs
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
@@ -47,12 +48,27 @@ from vllm_ascend.utils import (
 )
 
 from ..methods import get_scheme_class
+from ..methods.kv_cache.fa_quant_sim import FA_QUANT_SIM_RECIPE
 from ..utils import is_fused_moe_layer
 
 _MOE_WEIGHT_LOADER_NAME_MAP = {
     "w13_scale_bias": "w13_scale",
     "w2_scale_bias": "w2_scale",
 }
+
+# The FA recipe whose Q/K branch is dynamic is recorded per attention module and
+# never as tensors, so its layers have to be discovered from ``quant_type``.
+_FA_QUANT_SIM_LAYER_SUFFIX = ".self_attn.quant_type"
+# FAKQuant parameters that a dynamic Q/K branch leaves without a home: their
+# scales are data-independent and are therefore not exported, so a checkpoint
+# that still ships them has nowhere to put them. Without these AutoWeightsLoader
+# rejects the checkpoint outright.
+_FA_QUANT_SIM_UNUSED_FA_SUFFIXES = (
+    ".fa_q.scale",
+    ".fa_k.scale",
+    ".fa_q.offset",
+    ".fa_k.offset",
+)
 
 
 def _make_modelslim_moe_weight_loader(
@@ -652,7 +668,14 @@ class AscendModelSlimConfig(QuantizationConfig):
             return AscendLinearMethod(scheme)
 
         elif isinstance(layer, AttentionLayerBase):
-            if self.is_fa_quant_layer(prefix):
+            if self.is_fa_quant_sim_layer(prefix) and self._is_full_attention_layer(layer):
+                from ..methods.kv_cache.fa_quant_sim import AscendFAQuantSimAttentionMethod
+
+                scheme = AscendFAQuantSimAttentionMethod(self.quant_description, prefix)
+                logger.debug(
+                    "Select AscendKVCacheMethod(FA-sim) for %s (layer=%s)", prefix, "AttentionLayerBase[fa-sim]"
+                )
+            elif self.is_fa_quant_layer(prefix):
                 fa_quant_type = self.quant_description["fa_quant_type"]
                 scheme = create_scheme_for_layer(fa_quant_type, prefix, "attention")
                 logger.debug("Select AscendKVCacheMethod for %s (layer=%s)", prefix, "AttentionLayerBase[fa]")
@@ -703,6 +726,34 @@ class AscendModelSlimConfig(QuantizationConfig):
             if layer_id_str.isdigit() and int(layer_id_str) in self.kvcache_quant_layers:
                 return True
         return False
+
+    def is_fa_quant_sim_layer(self, prefix):
+        if self.enable_fa_quant_sim:
+            layer_id_str = "".join(re.findall(r"\.(\d+)\.", prefix))
+            if layer_id_str.isdigit() and int(layer_id_str) in self.fa_quant_sim_layers:
+                return True
+        return False
+
+    @staticmethod
+    def _is_full_attention_layer(layer: torch.nn.Module) -> bool:
+        """The simulated FA recipe only applies to standard full-attention
+        ``Attention`` layers. Other AttentionLayerBase subclasses (GDN/Mamba,
+        encoder attention, ...) must not get the simulated FA method: they have
+        no ``num_kv_heads`` and would install the QDQ backend on the wrong
+        layer type."""
+        from vllm.model_executor.layers.attention import Attention
+
+        return isinstance(layer, Attention)
+
+    @property
+    def _ignore_unexpected_suffixes(self) -> tuple[str, ...]:
+        base = QuantizationConfig._ignore_unexpected_suffixes
+        if getattr(self, "enable_fa_quant_sim", False):
+            # Same reasoning as the C8-MXFP recipe: the simulated recipe's Q/K
+            # branch is dynamic, so a checkpoint that still ships their scales
+            # has nowhere to put them.
+            return (*base, *_FA_QUANT_SIM_UNUSED_FA_SUFFIXES)
+        return base
 
     def enabling_fa_quant(self, vllm_config, layer_name) -> bool:
         is_decode_instance = (
@@ -944,3 +995,65 @@ class AscendModelSlimConfig(QuantizationConfig):
                     self.indexer_quant_layers.append(int(_id))
                 if "k_proj.kv_cache_scale" in key:
                     self.c8_quant_layers.append(int(_id))
+        self._add_fa_quant_sim_metadata()
+
+    def _add_fa_quant_sim_metadata(self) -> None:
+        """Register the simulated FA layers requested by ``VLLM_ASCEND_FA_QUANT_SIMULATE``.
+
+        Two separate problems are solved here.
+
+        First, a recipe whose Q/K branch is dynamic exports no tensors at all
+        (ModelSlim's FA3 processor keeps only a placeholder for a data-independent
+        scope), so the ``fa_k.scale`` scan above records no layer and the FA
+        scheme would never be selected -- ``quant_type`` is the only remaining
+        trace of the recipe.
+
+        Second, such a checkpoint can still carry ``fa_quant_type``, and
+        FAKQuant's mapper would then rename ``fa_v.scale`` into an MLA submodule
+        that a dense model does not have, silently dropping the calibrated
+        scale. FAKQuant is therefore stood down for this recipe.
+        """
+        fa_quant_type = self.quant_description.get("fa_quant_type", "")
+        self.enable_fa_quant_sim = False
+        self.fa_quant_sim_layers: list[int] = []
+        if not envs.VLLM_ASCEND_FA_QUANT_SIMULATE:
+            return
+
+        observed: dict[str, int] = {}
+        for key, value in self.quant_description.items():
+            if not key.endswith(_FA_QUANT_SIM_LAYER_SUFFIX) or not isinstance(value, str):
+                continue
+            observed[value] = observed.get(value, 0) + 1
+            if value != FA_QUANT_SIM_RECIPE:
+                continue
+            layer_id_str = "".join(re.findall(r"\.(\d+)\.", key))
+            if layer_id_str.isdigit():
+                self.fa_quant_sim_layers.append(int(layer_id_str))
+
+        if not self.fa_quant_sim_layers:
+            logger.warning_once(
+                "[quantization] VLLM_ASCEND_FA_QUANT_SIMULATE=1 but no attention layer "
+                "declares %s; the checkpoint declares %s. Simulated FA quantization is off.",
+                FA_QUANT_SIM_RECIPE,
+                observed or "no per-layer %s at all" % _FA_QUANT_SIM_LAYER_SUFFIX,
+            )
+            return
+
+        self.enable_fa_quant_sim = True
+        if self.enable_fa_quant:
+            logger.warning_once(
+                "[quantization] fa_quant_type=%s is declared alongside the simulated FA "
+                "recipe %s; ignoring FAKQuant, whose mapper cannot host a dense model's "
+                "fa_v scale.",
+                fa_quant_type,
+                FA_QUANT_SIM_RECIPE,
+            )
+            self.enable_fa_quant = False
+            self.kvcache_quant_layers = []
+        logger.info_once(
+            "[quantization] Simulating FA quantization for recipe %s on %d attention "
+            "layer(s): Q/K int8 per token-head (dynamic), V int8 per head "
+            "(checkpoint scale), KV cache kept in the model dtype.",
+            FA_QUANT_SIM_RECIPE,
+            len(self.fa_quant_sim_layers),
+        )

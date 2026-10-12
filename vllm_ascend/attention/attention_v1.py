@@ -1309,6 +1309,103 @@ class AscendAttentionBackendImpl(AttentionImpl):
         return output
 
 
+class AscendFAQuantSimAttentionBackendImpl(AscendAttentionBackendImpl):
+    """Simulated (quantize-dequantize) FA quantization for dense-attention models.
+
+    Activated via class surgery in ``AscendFAQuantSimAttentionMethod.create_weights``
+    (``vllm_ascend/quantization/methods/kv_cache/fa_quant_sim.py``).
+
+    Serves the ModelSlim recipe ``QK_INT8_DYNAMIC_V_INT8``: Q and K quantized
+    dynamically per (token, head), V with the checkpoint's static per-head
+    scale. The real path runs that inside an INT8 attention kernel and stores
+    the KV cache in int8; this backend instead replays the very same
+    quantize-dequantize round trip on the projection outputs and then hands
+    the result to the ordinary attention, so the cache stays in the model
+    dtype and no quantized kernel is required.
+
+    Scope, by design: it reproduces the *numerical* effect of the recipe, which
+    is what it exists for, but it is slower than the plain path and it does not
+    exercise the int8 cache layout, the INT8 attention kernel, or any
+    scale-cache plumbing. Use it to attribute an accuracy delta to the recipe,
+    not to validate the kernel.
+    """
+
+    @staticmethod
+    def _qdq_symmetric_int8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Round-trip ``x`` through symmetric INT8, computed in fp32.
+
+        Mirrors ModelSlim's ``calculate_int_qparam`` + ``int_quantize``: the
+        symmetric bound is ``2**7 - 1 = 127`` and the rounded value is clamped
+        to ``[-128, 127]``. ``torch.round`` and ModelSlim's ``Tensor.round_``
+        are the same half-to-even rounding, so the replay matches the reference
+        up to the final cast back to the model dtype.
+        """
+        q = torch.round(x.to(torch.float32) / scale).clamp_(-128.0, 127.0)
+        return (q * scale).to(x.dtype)
+
+    def _restore_padding(self, out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Re-attach the untouched padding tail of ``x`` to the QDQ result."""
+        if out.shape[0] == x.shape[0]:
+            return out
+        return torch.cat((out, x[out.shape[0] :]), dim=0)
+
+    def _qdq_per_token_head(self, x: torch.Tensor, num_actual_tokens: int) -> torch.Tensor:
+        """Dynamic per-(token, head) quantization over the last dim.
+
+        ModelSlim's ``FakeQuantActivationPerToken`` reshapes ``(B, H, S, D)`` to
+        ``(B*H*S, D)`` and reduces over ``D``, giving one scale per token *and*
+        head -- the "per-token-head" of the recipe. Here the tensor is
+        ``(T, H, D)``, so the reduction is over ``D`` for each ``(t, h)``.
+        """
+        x_actual = x[:num_actual_tokens]
+        absmax = x_actual.to(torch.float32).abs().amax(dim=-1, keepdim=True)
+        scale = absmax.div(127.0).clamp_min(torch.finfo(torch.float32).eps)
+        return self._restore_padding(self._qdq_symmetric_int8(x_actual, scale), x)
+
+    def _qdq_per_head(self, layer: AttentionLayer, x: torch.Tensor, num_actual_tokens: int) -> torch.Tensor:
+        """Static per-KV-head quantization with the checkpoint's calibrated scale.
+
+        The scale is read off the layer (``layer.fa_v.scale``, reshaped by
+        ``process_weights_after_loading``) rather than off the impl, matching
+        how the C8 and MXFP8 paths hand their per-head cache scales over.
+        """
+        fa_v = getattr(layer, "fa_v", None)
+        scale = getattr(fa_v, "scale", None) if fa_v is not None else None
+        if scale is None:
+            return x
+        out = self._qdq_symmetric_int8(x[:num_actual_tokens], scale)
+        return self._restore_padding(out, x)
+
+    def forward(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert output is not None, "Output tensor must be provided."
+        num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", 0) if attn_metadata is not None else 0
+        if num_actual_tokens:
+            query = self._qdq_per_token_head(query, num_actual_tokens)
+            # KV-sharing consumers read another layer's cache and write none of
+            # their own, so their (dummy) K/V must not be quantized.
+            if (
+                key is not None
+                and value is not None
+                and getattr(self, "kv_sharing_target_layer_name", None) is None
+            ):
+                key = self._qdq_per_token_head(key, num_actual_tokens)
+                value = self._qdq_per_head(layer, value, num_actual_tokens)
+        return super().forward(
+            layer, query, key, value, kv_cache, attn_metadata, output, output_scale, output_block_scale
+        )
+
+
 class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
     """Attention backend implementation for INT8 KV cache (C8/QuaRot) models.
 

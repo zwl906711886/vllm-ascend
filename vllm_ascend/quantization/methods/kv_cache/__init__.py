@@ -16,10 +16,18 @@
 #
 """KV cache quantization methods for Ascend NPU."""
 
+from .fa_quant_sim import (
+    FA_QUANT_SIM_RECIPE,
+    FA_QUANT_SIM_SCHEME,
+    AscendFAQuantSimAttentionMethod,
+)
 from .kv_c8 import AscendC8KVCacheAttentionMethod, AscendFAQuantAttentionMethod, AscendSFAQuantAttentionMethod
 
 __all__ = [
+    "FA_QUANT_SIM_RECIPE",
+    "FA_QUANT_SIM_SCHEME",
     "AscendC8KVCacheAttentionMethod",
     "AscendFAQuantAttentionMethod",
+    "AscendFAQuantSimAttentionMethod",
     "AscendSFAQuantAttentionMethod",
 ]

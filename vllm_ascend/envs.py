@@ -87,6 +87,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Replay (rather than execute) the attention quantization of a ModelSlim
+    # checkpoint whose recipe is Q/K per-token dynamic + V per-head static
+    # (exported ``quant_type``: QK_INT8_DYNAMIC_V_INT8).
+    # The model runs in its native dtype with a native-dtype KV cache, and the
+    # attention backend applies the int8 quantize-dequantize round trip on
+    # Q/K/V so the accuracy impact of the recipe can be measured without an
+    # INT8 attention kernel. Valid values: 0 or 1. Default: 0 (disabled).
+    "VLLM_ASCEND_FA_QUANT_SIMULATE": lambda: _strict_binary_env("VLLM_ASCEND_FA_QUANT_SIMULATE"),
 }
 
 # end-env-vars-definition
